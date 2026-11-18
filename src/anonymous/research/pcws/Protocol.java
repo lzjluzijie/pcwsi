@@ -1,21 +1,22 @@
 package anonymous.research.pcws;
 
 import static edu.alibaba.mpc4j.common.tool.crypto.hash.HashFactory.HashType.JDK_SHA256;
+import static anonymous.research.pcws.ZpHash.add;
+import static anonymous.research.pcws.ZpHash.sub;
 
+import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import edu.alibaba.mpc4j.common.rpc.Party;
-import edu.alibaba.mpc4j.common.rpc.Rpc;
 import edu.alibaba.mpc4j.common.rpc.desc.PtoDesc;
 import edu.alibaba.mpc4j.common.rpc.desc.SecurityModel;
 import edu.alibaba.mpc4j.common.rpc.pto.AbstractMultiPartyPto;
@@ -23,26 +24,29 @@ import edu.alibaba.mpc4j.common.rpc.pto.AbstractMultiPartyPtoConfig;
 import edu.alibaba.mpc4j.common.structure.okve.dokvs.zp.SparseZpDokvs;
 import edu.alibaba.mpc4j.common.structure.okve.dokvs.zp.ZpDokvsFactory;
 import edu.alibaba.mpc4j.common.structure.okve.dokvs.zp.ZpDokvsFactory.ZpDokvsType;
+import edu.alibaba.mpc4j.common.tool.MathPreconditions;
 import edu.alibaba.mpc4j.common.tool.crypto.hash.Hash;
 import edu.alibaba.mpc4j.common.tool.crypto.hash.HashFactory;
-import edu.alibaba.mpc4j.common.tool.crypto.prf.Prf;
-import edu.alibaba.mpc4j.common.tool.crypto.prf.PrfFactory;
 import edu.alibaba.mpc4j.common.tool.galoisfield.zp.Zp;
 import edu.alibaba.mpc4j.common.tool.galoisfield.zp.ZpFactory;
+import edu.alibaba.mpc4j.common.tool.network.PermutationNetworkUtils;
 import edu.alibaba.mpc4j.common.tool.utils.BigIntegerUtils;
 import edu.alibaba.mpc4j.common.tool.utils.CommonUtils;
+import edu.alibaba.mpc4j.common.tool.utils.LongUtils;
 
 /**
  * PCWS (Private Computation Weighted Sum) Protocol Implementation
  * <p>
  * This protocol implements a multi-party computation for computing weighted sums
  * over key-value pairs with privacy preservation.
- *
- * @author Zijie Lu
  */
 public class Protocol extends AbstractMultiPartyPto {
     private static final Hash SHA256 = HashFactory.createInstance(JDK_SHA256, 32);
     private static final int STEP = 0;
+    // Tweak of the hash that maps F_K to Z_p
+    private static final int PRF_TWEAK = 0;
+    // Appended to the input of F̃ to separate it from the tags F̂
+    private static final byte[] TILDE_DOMAIN = {1};
 
     // Configuration
     private final Config config;
@@ -62,16 +66,34 @@ public class Protocol extends AbstractMultiPartyPto {
     private final ZpDokvsType zpDokvsType;
     private final Zp zP, zQ;
     private final int okvsSize;
+    private final int pByteLength, qByteLength;  // fixed-width encodings of Z_p and Z_q elements
     private final SecureRandom secureRandom;
-    private final Prf prf;             // PRF for F: {0,1}^κ × {0,1}^l → Z_p
-    private final SparseZpDokvs<Long> okvs;  // OKVS instance
+    private final ZpHash zpHash;
+    // OKVS, always encoded doubly (free cells random) so that keys outside a table decode to random values. Each run
+    // gets a fresh instance, dropped at the end of the reduction, because an instance keeps the intermediate
+    // structures of its last encoding.
+    private final byte[][] okvsKeys;
+    private SparseZpDokvs<Long> okvs;
+    private final OffsetLookup.Config lookupConfig;
+    private Schedule schedule = Schedule.NONE;
+
+    // Measurements of the current execute() call
+    private final MeteredRpc meter;
+    private long startNanos;
+    private long waitNanosAtStart;
+    private long recvBytesAtStart;
+    private long sentBytesAtStart;
+    private Phase reduction;
+    private Phase offline;
+    private Phase total;
 
     /**
      * Constructor
      */
-    public Protocol(Rpc rpc, Config config, Party... otherParties) {
+    public Protocol(MeteredRpc rpc, Config config, Party... otherParties) {
         super(PcwsPtoDesc.getInstance(), config, rpc, otherParties);
 
+        this.meter = rpc;
         this.config = config;
         this.topologyType = config.getTopologyType();
         this.resultType = config.getResultType();
@@ -87,18 +109,18 @@ public class Protocol extends AbstractMultiPartyPto {
         this.zQ = ZpFactory.createInstance(envType, q);
         this.zpDokvsType = config.getZpDokvsType();
         this.okvsSize = ZpDokvsFactory.getM(zpDokvsType, size);
+        this.pByteLength = CommonUtils.getByteLength(p.bitLength());
+        this.qByteLength = CommonUtils.getByteLength(q.bitLength());
 
         this.secureRandom = new SecureRandom();
-        this.prf = PrfFactory.createInstance(envType, secLevel / 8);
+        this.zpHash = new ZpHash(p);
 
-        // Initialize OKVS with H3_SPARSE_CLUSTER_BLAZE_GCT
-        byte[][] okvsKeys = new byte[3][secLevel / 8]; // H3 requires 3 keys
+        // Keys of the H3_SPARSE_CLUSTER_BLAZE_GCT OKVS
+        this.okvsKeys = new byte[3][secLevel / 8]; // H3 requires 3 keys
         for (int i = 0; i < 3; i++) {
             okvsKeys[i][i] = (byte) i;
         }
-        this.okvs = ZpDokvsFactory.createSparseInstance(
-                envType, zpDokvsType, p, size, okvsKeys
-        );
+        this.lookupConfig = new OffsetLookup.Config(config.isSilent());
     }
 
     public Config getConfig() {
@@ -106,91 +128,156 @@ public class Protocol extends AbstractMultiPartyPto {
     }
 
     /**
-     * Main protocol execution
+     * Runs the reductions of the following execute() calls under the given schedule, see {@link Schedule}. Not for
+     * the AIDED and LOOKUP topologies.
      */
-    public void execute(KeyValuePair[] inputPairs) throws Exception {
-        switch (topologyType) {
-            case RING -> executeRing(inputPairs);
-            case STAR -> executeStar(inputPairs);
+    public void setSchedule(Schedule.Mode mode, Path dir) throws IOException {
+        schedule = mode == Schedule.Mode.NONE ? Schedule.NONE
+                : new Schedule(mode, dir, meter, topologyType, parties, okvsSize, p);
+    }
+
+    /**
+     * Measurements of the reduction to two-party PC-WSI, which ends at the mod-q truncation (P1, P2) or after
+     * forwarding the masked OKVS (P3-Pn). Empty for the AIDED and LOOKUP topologies.
+     */
+    public Phase getReduction() {
+        return reduction;
+    }
+
+    /**
+     * Measurements up to the end of the input-independent part of the two-party protocol: its initialization and
+     * offline phase for LOOKUP. Equal to the reduction for the other two-party protocols and for P3-Pn.
+     */
+    public Phase getOffline() {
+        return offline;
+    }
+
+    /**
+     * Measurements of the whole execute() call.
+     */
+    public Phase getTotal() {
+        return total;
+    }
+
+    /**
+     * Main protocol execution
+     *
+     * @return for P1 with result type AIDED or LOOKUP, or topology AIDED or LOOKUP, the weight sums aligned with P2's
+     * input order (null where the item is not in the intersection); otherwise null.
+     */
+    public BigInteger[] execute(KeyValuePair[] inputPairs) throws Exception {
+        if (inputPairs != null) {
+            for (KeyValuePair pair : inputPairs) {
+                if (pair.value() < 0 || BigInteger.valueOf(pair.value()).compareTo(upperBoundM) >= 0) {
+                    throw new IllegalArgumentException("Weights must be in [0, M)");
+                }
+            }
         }
+        okvs = ZpDokvsFactory.createSparseInstance(envType, zpDokvsType, p, size, okvsKeys);
+        startNanos = System.nanoTime();
+        waitNanosAtStart = meter.getWaitNanos();
+        recvBytesAtStart = meter.getReceivedByteLength();
+        sentBytesAtStart = rpc.getPayloadByteLength();
+        offline = null;
+        schedule.begin();
+        BigInteger[] output = switch (topologyType) {
+            case STAR -> executeStar(inputPairs);
+            case RING, TREE -> executeRing(inputPairs);
+            case AIDED -> executeAided(inputPairs);
+            case LOOKUP -> executeLookup(inputPairs);
+        };
+        total = snapshot();
+        if (offline == null) {
+            offline = reduction;
+        }
+        return output;
+    }
+
+    /**
+     * Server-aided two-party PC-WSI on the raw inputs of P1 and P2, with P3 as the server.
+     */
+    public BigInteger[] executeAided(KeyValuePair[] inputPairs) {
+        reduction = snapshot();
+        int partyId = rpc.ownParty().getPartyId();
+        if (partyId == 2) {
+            runAidedServer();
+            return null;
+        }
+        BigInteger[] keys = Arrays.stream(inputPairs).map(pair -> BigInteger.valueOf(pair.key()))
+                                  .toArray(BigInteger[]::new);
+        BigInteger[] values = Arrays.stream(inputPairs).map(pair -> BigInteger.valueOf(pair.value()))
+                                    .toArray(BigInteger[]::new);
+        if (partyId == 0) {
+            return runAidedP1(keys, values);
+        }
+        runAidedP2(keys, values);
+        return null;
+    }
+
+    /**
+     * Offset-lookup two-party PC-WSI on the raw inputs of P1 and P2.
+     */
+    public BigInteger[] executeLookup(KeyValuePair[] inputPairs) throws Exception {
+        reduction = snapshot();
+        BigInteger[] keys = Arrays.stream(inputPairs).map(pair -> BigInteger.valueOf(pair.key()))
+                                  .toArray(BigInteger[]::new);
+        BigInteger[] values = Arrays.stream(inputPairs).map(pair -> BigInteger.valueOf(pair.value()))
+                                    .toArray(BigInteger[]::new);
+        if (rpc.ownParty().getPartyId() == 0) {
+            return runLookupP1(keys, values);
+        }
+        runLookupP2(keys, values);
+        return null;
     }
 
     /**
      * Star topology execution
      */
-    public void executeStar(KeyValuePair[] inputPairs) throws Exception {
+    public BigInteger[] executeStar(KeyValuePair[] inputPairs) throws Exception {
         int partyId = rpc.ownParty().getPartyId();
 
         if (partyId == 0) {
-            runP1Star(inputPairs);
+            return runP1Star(inputPairs);
         } else if (partyId == 1) {
             runP2Star(inputPairs);
         } else {
             runPnStar(inputPairs);
         }
+        return null;
     }
 
     /**
-     * Ring topology execution
+     * Ring and tree topology execution. Both use the double-layered masks and differ only in routing.
      */
-    public void executeRing(KeyValuePair[] inputPairs) throws Exception {
+    public BigInteger[] executeRing(KeyValuePair[] inputPairs) throws Exception {
         int partyId = rpc.ownParty().getPartyId();
 
         if (partyId == 0) {
-            runP1Ring(inputPairs);
+            return runP1Ring(inputPairs);
         } else if (partyId == 1) {
             runP2Ring(inputPairs);
         } else {
             runPnRing(inputPairs);
         }
+        return null;
     }
 
     /**
      * P1's protocol execution - Star topology
      */
-    public void runP1Star(KeyValuePair[] inputPairs) throws Exception {
+    public BigInteger[] runP1Star(KeyValuePair[] inputPairs) throws Exception {
         // P1 computes T = sum_{i=2}^{n} T_i' and U = {u_j | u_j = Decode(T, x_{1,j}), j ∈ [m]}
+        schedule.awaitTurn();
         BigInteger[] okvsData = new BigInteger[okvsSize];
         Arrays.fill(okvsData, BigInteger.ZERO);
-
-        // Receive masked OKVS from P2
-        BigInteger[] p2OkvsData = receiveBigIntegerArray(STEP, rpc.getParty(1));
-        for (int i = 0; i < okvsSize; i++) {
-            okvsData[i] = zP.add(okvsData[i], p2OkvsData[i]);
-        }
-
-        // Receive masked OKVS from P3-Pn asynchronously
-        List<CompletableFuture<BigInteger[]>> recvOkvsFutures =
-                IntStream.range(2, parties)
-                         .mapToObj(k -> CompletableFuture.supplyAsync(() ->
-                                 receiveBigIntegerArray(STEP, rpc.getParty(k))
-                         )).toList();
-        List<BigInteger[]> receivedOkvsList = recvOkvsFutures.stream().map(CompletableFuture::join).toList();
-        for (BigInteger[] receivedOkvsData : receivedOkvsList) {
-            for (int i = 0; i < okvsSize; i++) {
-                okvsData[i] = zP.add(okvsData[i], receivedOkvsData[i]);
-            }
-        }
+        addReceived(okvsData, IntStream.range(1, parties).toArray());
 
         // Decode U = {u_j | u_j = Decode(T, x_{1,j}), j ∈ [m]}
         BigInteger[] U = new BigInteger[size];
         for (int i = 0; i < size; i++) {
             U[i] = okvs.decode(okvsData, inputPairs[i].key());
         }
-
-        BigInteger[] finalKeys = new BigInteger[size];
-        BigInteger[] finalValues = new BigInteger[size];
-
-        for (int i = 0; i < size; i++) {
-            // Compute y_j = floor(u_j / q) ∈ Z_q
-            finalKeys[i] = U[i].divide(q);
-            finalValues[i] = zQ.add(U[i].mod(q), BigInteger.valueOf(inputPairs[i].value()));
-        }
-
-        switch (resultType) {
-            case RAW -> runRawP1(finalKeys, finalValues);
-            case AIDED -> runAidedP1(finalKeys, finalValues);
-        }
+        return truncateP1(U, inputPairs);
     }
 
     /**
@@ -215,57 +302,19 @@ public class Protocol extends AbstractMultiPartyPto {
                     rpc.getParty(k), seeds[k - 2]);
         }
 
-        BigInteger[] maskData = new BigInteger[okvsSize];
-        Arrays.fill(maskData, BigInteger.ZERO);
-        for (int k = 2; k < parties; k++) {
-            BigInteger[] otherMaskData = generatePRGVector(seeds[k - 2]);
-            for (int i = 0; i < okvsSize; i++) {
-                maskData[i] = zP.sub(maskData[i], otherMaskData[i]);
-            }
-        }
-
+        schedule.awaitTurn();
         BigInteger[] p2Random = new BigInteger[size];
-        for (int i = 0; i < size; i++) {
-            p2Random[i] = zP.createRandom(secureRandom);
-        }
+        BigInteger[] okvsData = schedule.local(() -> {
+            BigInteger[] data = okvs.encode(p2KeyValueMap(prfKey, inputPairs, p2Random), true);
+            // Masked OKVS T_2' = T_2 + Γ_2, where Γ_2 = -sum_{i=3}^{n} G(s_i)
+            for (byte[] seed : seeds) {
+                addPrgVector(data, seed, true);
+            }
+            return data;
+        });
 
-        prf.setKey(prfKey);
-
-        Map<Long, BigInteger> keyValueMap = new HashMap<>();
-        for (int i = 0; i < size; i++) {
-            long key = inputPairs[i].key();
-            long value = inputPairs[i].value();
-
-            // Compute F_K(x_{2,j})
-            BigInteger fkValue = zP.createRandom(prf.getBytes(BigInteger.valueOf(key).toByteArray()));
-
-            // Compute v_{2,j} + r_j - (n-2) * F_K(x_{2,j})
-            BigInteger valueResult = zP.add(BigInteger.valueOf(value), zP.sub(p2Random[i], zP.mul(BigInteger.valueOf(parties - 2), fkValue)));
-
-            keyValueMap.put(key, valueResult);
-        }
-
-        BigInteger[] okvsData = okvs.encode(keyValueMap, false);
-
-        // Send masked OKVS T_2' = T_2 + Γ_2 to P1
-        for (int i = 0; i < okvsSize; i++) {
-            okvsData[i] = zP.add(okvsData[i], maskData[i]);
-        }
-
-        sendBigIntegerArray(STEP, rpc.getParty(0), okvsData);
-
-        // P2 performs modulo-q truncation for r_j values
-        BigInteger[] finalKeys = new BigInteger[size];
-        BigInteger[] finalValues = new BigInteger[size];
-        for (int i = 0; i < size; i++) {
-            finalKeys[i] = p2Random[i].divide(q);
-            finalValues[i] = zQ.neg(p2Random[i]);
-        }
-
-        switch (resultType) {
-            case RAW -> runRawP2(finalKeys, finalValues);
-            case AIDED -> runAidedP2(finalKeys, finalValues);
-        }
+        sendBigIntegerArray(STEP, rpc.getParty(0), okvsData, pByteLength);
+        truncateP2(p2Random);
     }
 
     /**
@@ -277,38 +326,19 @@ public class Protocol extends AbstractMultiPartyPto {
 
         byte[] seed = receiveByteArray(STEP,
                 rpc.getParty(1));
-        SecureRandom seededRandom = new SecureRandom(seed);
 
-        BigInteger[] maskData = generatePRGVector(seed);
+        schedule.awaitTurn();
+        BigInteger[] okvsData = schedule.local(() -> {
+            // Generate OKVS T_i ← Encode({x_{i,j}, v_{i,j} + F_K(x_{i,j})}_{j∈[m]})
+            BigInteger[] data = okvs.encode(pnKeyValueMap(prfKey, inputPairs), true);
+            // Masked OKVS T_i' = T_i + Γ_i, where Γ_i = G(s_i)
+            addPrgVector(data, seed, false);
+            return data;
+        });
 
-        prf.setKey(prfKey);
+        sendBigIntegerArray(STEP, rpc.getParty(0), okvsData, pByteLength);
 
-        // Generate OKVS T_i ← Encode({x_{i,j}, v_{i,j} + F_K(x_{i,j})}_{j∈[m]})
-        Map<Long, BigInteger> keyValueMap = new HashMap<>();
-        for (int i = 0; i < size; i++) {
-            long key = inputPairs[i].key();
-            long value = inputPairs[i].value();
-
-            // Compute F_K(x_{i,j})
-            BigInteger fkValue = zP.createRandom(prf.getBytes(BigInteger.valueOf(key).toByteArray()));
-//            BigInteger fkValue = zP.createZero();
-
-            // Compute v_{i,j} + F_K(x_{i,j})
-            BigInteger valueResult = zP.add(BigInteger.valueOf(value), fkValue);
-
-            keyValueMap.put(key, valueResult);
-        }
-
-        BigInteger[] okvsData = okvs.encode(keyValueMap, false);
-
-        // Send masked OKVS T_i' = T_i + Γ_i to P1
-        BigInteger[] okvsMaskedData = new BigInteger[okvsSize];
-        for (int i = 0; i < okvsSize; i++) {
-            okvsMaskedData[i] = okvsData[i].add(maskData[i]).mod(p);
-        }
-
-        sendBigIntegerArray(STEP, rpc.getParty(0), okvsMaskedData);
-
+        endReduction();
         if (rpc.ownParty().getPartyId() == 2) {
             switch (resultType) {
                 case AIDED -> runAidedServer();
@@ -317,9 +347,9 @@ public class Protocol extends AbstractMultiPartyPto {
     }
 
     /**
-     * P1's protocol execution - Ring topology
+     * P1's protocol execution - Ring or tree topology
      */
-    public void runP1Ring(KeyValuePair[] inputPairs) throws Exception {
+    public BigInteger[] runP1Ring(KeyValuePair[] inputPairs) throws Exception {
         // Step 2: P1 samples and sends lambda seeds to P3-Pn
         byte[][] lambdaSeeds = new byte[parties - 2][secLevel / 8];
         for (int i = 0; i < lambdaSeeds.length; i++) {
@@ -331,45 +361,27 @@ public class Protocol extends AbstractMultiPartyPto {
                     rpc.getParty(k), lambdaSeeds[k - 2]);
         }
 
-        BigInteger[] maskData = new BigInteger[okvsSize];
-        Arrays.fill(maskData, BigInteger.ZERO);
-        for (int k = 2; k < parties; k++) {
-            BigInteger[] otherMaskData = generatePRGVector(lambdaSeeds[k - 2]);
-            for (int i = 0; i < okvsSize; i++) {
-                maskData[i] = zP.sub(maskData[i], otherMaskData[i]);
+        // T = T_n' + Λ_1 (ring) or T = sum_{c ∈ ch(1)} T_c' + Λ_1 (tree), where Λ_1 = -sum_{i=3}^{n} G(t_i)
+        schedule.awaitTurn();
+        BigInteger[] finalOkvsData = schedule.local(() -> {
+            BigInteger[] data = new BigInteger[okvsSize];
+            Arrays.fill(data, BigInteger.ZERO);
+            for (byte[] seed : lambdaSeeds) {
+                addPrgVector(data, seed, true);
             }
-        }
-
-        BigInteger[] finalOkvsData = receiveBigIntegerArray(
-                STEP,
-                rpc.getParty(parties - 1));
-
-        for (int i = 0; i < okvsSize; i++) {
-            finalOkvsData[i] = zP.add(finalOkvsData[i], maskData[i]);
-        }
+            return data;
+        });
+        addReceived(finalOkvsData, upstreamOf(0));
 
         BigInteger[] U = new BigInteger[size];
         for (int i = 0; i < size; i++) {
             U[i] = okvs.decode(finalOkvsData, inputPairs[i].key());
         }
-
-        // Modulo-q truncation and send to P2
-        BigInteger[] finalKeys = new BigInteger[size];
-        BigInteger[] finalValues = new BigInteger[size];
-
-        for (int i = 0; i < size; i++) {
-            finalKeys[i] = U[i].divide(q);
-            finalValues[i] = zQ.add(U[i].mod(q), BigInteger.valueOf(inputPairs[i].value()));
-        }
-
-        switch (resultType) {
-            case RAW -> runRawP1(finalKeys, finalValues);
-            case AIDED -> runAidedP1(finalKeys, finalValues);
-        }
+        return truncateP1(U, inputPairs);
     }
 
     /**
-     * P2's protocol execution - Ring topology
+     * P2's protocol execution - Ring or tree topology
      */
     public void runP2Ring(KeyValuePair[] inputPairs) throws Exception {
         byte[] prfKey = new byte[secLevel / 8];
@@ -390,57 +402,25 @@ public class Protocol extends AbstractMultiPartyPto {
                     rpc.getParty(k), gammaSeeds[k - 2]);
         }
 
-        BigInteger[] maskData = new BigInteger[okvsSize];
-        Arrays.fill(maskData, BigInteger.ZERO);
-        for (int k = 2; k < parties; k++) {
-            BigInteger[] otherMaskData = generatePRGVector(gammaSeeds[k - 2]);
-            for (int i = 0; i < okvsSize; i++) {
-                maskData[i] = zP.sub(maskData[i], otherMaskData[i]);
-            }
-        }
-
+        schedule.awaitTurn();
         BigInteger[] p2Random = new BigInteger[size];
-        for (int i = 0; i < size; i++) {
-            p2Random[i] = zP.createRandom(secureRandom);
-        }
-
-        prf.setKey(prfKey);
-        Map<Long, BigInteger> keyValueMap = new HashMap<>();
-        for (int i = 0; i < size; i++) {
-            long key = inputPairs[i].key();
-            long value = inputPairs[i].value();
-
-            BigInteger fkValue = zP.createRandom(prf.getBytes(BigInteger.valueOf(key).toByteArray()));
-            BigInteger valueResult = zP.add(BigInteger.valueOf(value),
-                    zP.sub(p2Random[i], zP.mul(BigInteger.valueOf(parties - 2), fkValue)));
-
-            keyValueMap.put(key, valueResult);
-        }
-
-        BigInteger[] p2OkvsData = okvs.encode(keyValueMap, false);
-        for (int i = 0; i < okvsSize; i++) {
-            p2OkvsData[i] = zP.add(p2OkvsData[i], maskData[i]);
-        }
+        // T_2' = T_2 + Γ_2 with Γ_2 = -sum_{i=3}^{n} G(s_i), plus sum_{c ∈ ch(2)} T_c' in the tree
+        BigInteger[] p2OkvsData = schedule.local(() -> {
+            BigInteger[] data = okvs.encode(p2KeyValueMap(prfKey, inputPairs, p2Random), true);
+            for (byte[] seed : gammaSeeds) {
+                addPrgVector(data, seed, true);
+            }
+            return data;
+        });
+        addReceived(p2OkvsData, upstreamOf(1));
 
         sendBigIntegerArray(STEP,
-                rpc.getParty(2), p2OkvsData);
-
-        // P2 performs modulo-q truncation for r_j values and check matches
-        BigInteger[] finalKeys = new BigInteger[size];
-        BigInteger[] finalValues = new BigInteger[size];
-        for (int i = 0; i < size; i++) {
-            finalKeys[i] = p2Random[i].divide(q);
-            finalValues[i] = zQ.neg(p2Random[i]);
-        }
-
-        switch (resultType) {
-            case RAW -> runRawP2(finalKeys, finalValues);
-            case AIDED -> runAidedP2(finalKeys, finalValues);
-        }
+                rpc.getParty(downstreamOf(1)), p2OkvsData, pByteLength);
+        truncateP2(p2Random);
     }
 
     /**
-     * P3-Pn parties' protocol execution - Ring topology
+     * P3-Pn parties' protocol execution - Ring or tree topology
      */
     public void runPnRing(KeyValuePair[] inputPairs) throws Exception {
         int partyId = rpc.ownParty().getPartyId();
@@ -449,51 +429,21 @@ public class Protocol extends AbstractMultiPartyPto {
         byte[] lambdaSeed = receiveByteArray(STEP, rpc.getParty(0));
         byte[] gammaSeed = receiveByteArray(STEP, rpc.getParty(1));
 
-        BigInteger[] lambdaVector = generatePRGVector(lambdaSeed);
-        BigInteger[] gammaVector = generatePRGVector(gammaSeed);
+        // Compute T_i' = T_i + Λ_i + Γ_i + T_{i-1}' (ring) or + sum_{c ∈ ch(i)} T_c' (tree), where Λ_i = G(t_i) and
+        // Γ_i = G(s_i)
+        schedule.awaitTurn();
+        BigInteger[] accumulatedOkvsData = schedule.local(() -> {
+            BigInteger[] data = okvs.encode(pnKeyValueMap(prfKey, inputPairs), true);
+            addPrgVector(data, lambdaSeed, false);
+            addPrgVector(data, gammaSeed, false);
+            return data;
+        });
+        addReceived(accumulatedOkvsData, upstreamOf(partyId));
 
-        prf.setKey(prfKey);
-        Map<Long, BigInteger> keyValueMap = new HashMap<>();
-        for (int i = 0; i < size; i++) {
-            long key = inputPairs[i].key();
-            long value = inputPairs[i].value();
+        sendBigIntegerArray(STEP,
+                rpc.getParty(downstreamOf(partyId)), accumulatedOkvsData, pByteLength);
 
-            BigInteger fkValue = zP.createRandom(prf.getBytes(BigInteger.valueOf(key).toByteArray()));
-            BigInteger valueResult = zP.add(BigInteger.valueOf(value), fkValue);
-
-            keyValueMap.put(key, valueResult);
-        }
-
-        BigInteger[] ownOkvsData = okvs.encode(keyValueMap, false);
-
-        BigInteger[] prevOkvsData;
-        if (partyId == 2) {
-            // P3 receives from P2
-            prevOkvsData = receiveBigIntegerArray(STEP, rpc.getParty(1));
-        } else {
-            // Pi receives from Pi-1
-            prevOkvsData = receiveBigIntegerArray(STEP, rpc.getParty(partyId - 1));
-        }
-
-        // Compute T_i' = T_i + T_{i-1}' + Λ_i + Γ_i
-        BigInteger[] accumulatedOkvsData = new BigInteger[okvsSize];
-        for (int i = 0; i < okvsSize; i++) {
-            accumulatedOkvsData[i] = zP.add(ownOkvsData[i], prevOkvsData[i]);
-            accumulatedOkvsData[i] = zP.add(accumulatedOkvsData[i], lambdaVector[i]);
-            accumulatedOkvsData[i] = zP.add(accumulatedOkvsData[i], gammaVector[i]);
-        }
-
-        // Send to next party
-        if (partyId == parties - 1) {
-            // Pn sends to P1
-            sendBigIntegerArray(STEP,
-                    rpc.getParty(0), accumulatedOkvsData);
-        } else {
-            // Pi sends to Pi+1
-            sendBigIntegerArray(STEP,
-                    rpc.getParty(partyId + 1), accumulatedOkvsData);
-        }
-
+        endReduction();
         if (rpc.ownParty().getPartyId() == 2) {
             switch (resultType) {
                 case AIDED -> runAidedServer();
@@ -501,9 +451,76 @@ public class Protocol extends AbstractMultiPartyPto {
         }
     }
 
+    /**
+     * P1's mod-q truncation, y_j = ⌊u_j / q⌋ and α_j = v_{1,j} + (u_j mod q), followed by the two-party protocol.
+     */
+    private BigInteger[] truncateP1(BigInteger[] U, KeyValuePair[] inputPairs) throws Exception {
+        BigInteger[] finalKeys = new BigInteger[size];
+        BigInteger[] finalValues = new BigInteger[size];
+        for (int i = 0; i < size; i++) {
+            BigInteger[] quotientAndRemainder = U[i].divideAndRemainder(q);
+            finalKeys[i] = quotientAndRemainder[0];
+            BigInteger alpha = quotientAndRemainder[1].add(BigInteger.valueOf(inputPairs[i].value()));
+            // LOOKUP needs α_j + β_j to be the weight sum itself, so α_j stays unreduced (below q + M)
+            finalValues[i] = resultType == ResultType.LOOKUP ? alpha : alpha.mod(q);
+        }
+
+        endReduction();
+        return switch (resultType) {
+            case NONE -> null;
+            case RAW -> {
+                runRawP1(finalKeys, finalValues);
+                yield null;
+            }
+            case AIDED -> runAidedP1(finalKeys, finalValues);
+            case LOOKUP -> runLookupP1(finalKeys, finalValues);
+        };
+    }
+
+    /**
+     * P2's mod-q truncation, z_j = ⌊r_j / q⌋ and β_j = -(r_j mod q), followed by the two-party protocol. β_j is taken
+     * mod q for AIDED and mod the prime of OffsetLookup for LOOKUP.
+     */
+    private void truncateP2(BigInteger[] p2Random) throws Exception {
+        BigInteger lookupPrime = resultType == ResultType.LOOKUP ? OffsetLookup.prime(size, upperBoundM) : null;
+        BigInteger[] finalKeys = new BigInteger[size];
+        BigInteger[] finalValues = new BigInteger[size];
+        schedule.tail(() -> {
+            for (int i = 0; i < size; i++) {
+                BigInteger[] quotientAndRemainder = p2Random[i].divideAndRemainder(q);
+                finalKeys[i] = quotientAndRemainder[0];
+                finalValues[i] = resultType == ResultType.LOOKUP ? quotientAndRemainder[1].negate().mod(lookupPrime)
+                        : zQ.neg(quotientAndRemainder[1]);
+            }
+        });
+
+        endReduction();
+        switch (resultType) {
+            case RAW -> runRawP2(finalKeys, finalValues);
+            case AIDED -> runAidedP2(finalKeys, finalValues);
+            case LOOKUP -> runLookupP2(finalKeys, finalValues);
+        }
+    }
+
+    public BigInteger[] runLookupP1(BigInteger[] keys, BigInteger[] values) throws Exception {
+        OffsetLookup.P1 lookup = new OffsetLookup.P1(rpc, rpc.getParty(1), lookupConfig);
+        lookup.init(size, upperBoundM);
+        lookup.offline();
+        offline = snapshot();
+        return lookup.online(Arrays.stream(keys).map(BigInteger::toByteArray).toArray(byte[][]::new), values);
+    }
+
+    public void runLookupP2(BigInteger[] keys, BigInteger[] values) throws Exception {
+        OffsetLookup.P2 lookup = new OffsetLookup.P2(rpc, rpc.getParty(0), lookupConfig);
+        lookup.init(size, upperBoundM);
+        lookup.offline();
+        offline = snapshot();
+        lookup.online(Arrays.stream(keys).map(BigInteger::toByteArray).toArray(byte[][]::new), values);
+    }
+
     public void runRawP1(BigInteger[] keys, BigInteger[] values) {
-        sendBigIntegerArray(STEP, rpc.getParty(1), keys);
-        sendBigIntegerArray(STEP, rpc.getParty(1), values);
+        sendBigIntegerArray(STEP, rpc.getParty(1), keys, pByteLength);
+        sendBigIntegerArray(STEP, rpc.getParty(1), values, qByteLength);
 
     }
 
@@ -549,7 +566,7 @@ public class Protocol extends AbstractMultiPartyPto {
         }
     }
 
-    public void runAidedP1(BigInteger[] keys, BigInteger[] values) {
+    public BigInteger[] runAidedP1(BigInteger[] keys, BigInteger[] values) {
         byte[] prfKey = receiveByteArray(STEP, rpc.getParty(1));
         List<byte[]> p1Keys = new ArrayList<>(keys.length);
         BigInteger[] p1Values = new BigInteger[keys.length];
@@ -557,14 +574,14 @@ public class Protocol extends AbstractMultiPartyPto {
         for (int i = 0; i < keys.length; i++) {
             byte[] hash = Arrays.copyOf(SHA256.digestToBytes(concat(prfKey, keys[i].toByteArray())), config.getPrfLength());
             p1Keys.add(hash);
-            p1Values[i] = zQ.add(values[i], zQ.createRandom(concat(prfKey, hash)));
+            p1Values[i] = add(values[i], tildeF(prfKey, hash), q);
         }
         sendPayload(STEP, rpc.getParty(2), p1Keys);
-        sendBigIntegerArray(STEP, rpc.getParty(2), p1Values);
+        sendBigIntegerArray(STEP, rpc.getParty(2), p1Values, qByteLength);
 
         List<byte[]> serverKeys = receivePayload(STEP, rpc.getParty(2));
         BigInteger[] serverValues = receiveBigIntegerArray(STEP, rpc.getParty(2));
-        HashMap<HashCode, BigInteger> serverMap = new HashMap<>(keys.length);
+        Map<HashCode, BigInteger> serverMap = HashMap.newHashMap(keys.length);
         for (int i = 0; i < keys.length; i++) {
             serverMap.put(new HashCode(serverKeys.get(i)), serverValues[i]);
         }
@@ -572,17 +589,20 @@ public class Protocol extends AbstractMultiPartyPto {
         List<byte[]> p2Keys = receivePayload(STEP, rpc.getParty(1));
         BigInteger[] p2Values = receiveBigIntegerArray(STEP, rpc.getParty(1));
 
+        BigInteger[] weightSums = new BigInteger[size];
         int count = 0;
         for (int i = 0; i < size; i++) {
-            HashCode hashCode = new HashCode(p2Keys.get(i));
-            if (serverMap.containsKey(hashCode)) {
+            BigInteger serverValue = serverMap.get(new HashCode(p2Keys.get(i)));
+            if (serverValue != null) {
                 count += 1;
+                weightSums[i] = add(p2Values[i], serverValue, q);
                 if (config.isDebug()) {
-                    System.out.println("Ring Match found: " + i + ", " + zQ.add(p2Values[i], serverMap.get(hashCode)));
+                    System.out.println("Ring Match found: " + i + ", " + weightSums[i]);
                 }
             }
         }
         System.out.println("Found count: " + count);
+        return weightSums;
     }
 
     public void runAidedP2(BigInteger[] keys, BigInteger[] values) {
@@ -600,12 +620,11 @@ public class Protocol extends AbstractMultiPartyPto {
             byte[] hash1 = Arrays.copyOf(SHA256.digestToBytes(concat(prfKey, keys[i].toByteArray())), config.getPrfLength());
             byte[] hash2 = Arrays.copyOf(SHA256.digestToBytes(concat(serverPrfKey, hash1)), config.getPrfLength());
             p2Keys.add(hash2);
-            p2Values[i] = zQ.sub(zQ.sub(values[i], zQ.createRandom(concat(prfKey, hash1))),
-                    zQ.createRandom(concat(serverPrfKey, hash1)));
+            p2Values[i] = sub(sub(values[i], tildeF(prfKey, hash1), q), tildeF(serverPrfKey, hash1), q);
         }
 
         sendPayload(STEP, rpc.getParty(0), p2Keys);
-        sendBigIntegerArray(STEP, rpc.getParty(0), p2Values);
+        sendBigIntegerArray(STEP, rpc.getParty(0), p2Values, qByteLength);
     }
 
     public void runAidedServer() {
@@ -613,54 +632,151 @@ public class Protocol extends AbstractMultiPartyPto {
 
         List<byte[]> p1Keys = receivePayload(STEP, rpc.getParty(0));
         BigInteger[] p1Values = receiveBigIntegerArray(STEP, rpc.getParty(0));
-        List<byte[]> serverKeys = new ArrayList<>(p1Keys.size());
+        byte[][] serverKeys = new byte[p1Keys.size()][];
         BigInteger[] serverValues = new BigInteger[p1Keys.size()];
 
+        // Entry i of S_1'' goes to position π(i)
+        int[] pi = PermutationNetworkUtils.randomPermutation(p1Keys.size(), secureRandom);
         for (int i = 0; i < p1Keys.size(); i++) {
             byte[] hash = Arrays.copyOf(SHA256.digestToBytes(concat(serverPrfKey, p1Keys.get(i))), config.getPrfLength());
-            serverKeys.add(hash);
-            serverValues[i] = zQ.add(p1Values[i], zQ.createRandom(concat(serverPrfKey, p1Keys.get(i))));
+            serverKeys[pi[i]] = hash;
+            serverValues[pi[i]] = add(p1Values[i], tildeF(serverPrfKey, p1Keys.get(i)), q);
         }
 
-        // permute
-
-        sendPayload(STEP, rpc.getParty(0), serverKeys);
-        sendBigIntegerArray(STEP, rpc.getParty(0), serverValues);
+        sendPayload(STEP, rpc.getParty(0), Arrays.asList(serverKeys));
+        sendBigIntegerArray(STEP, rpc.getParty(0), serverValues, qByteLength);
     }
 
     /**
-     * Generate PRG vector from seed
+     * F̃_k(h) ∈ Z_q of the server-aided protocol: SHA-256(k‖h‖1) mod q. The tags F̂_k(h) are SHA-256(k‖h), so a tag
+     * reveals nothing about F̃_k(h). The 256-bit digest is within statistical distance 2^-λ of uniform mod q as long
+     * as |q| + λ ≤ 256.
      */
-    private BigInteger[] generatePRGVector(byte[] seed) {
-//        System.out.println(this.ownParty().getPartyId());
-//        System.out.println(Arrays.toString(seed));
+    private BigInteger tildeF(byte[] key, byte[] h) {
+        return new BigInteger(1, SHA256.digestToBytes(concat(concat(key, h), TILDE_DOMAIN))).mod(q);
+    }
 
+    /**
+     * F_K(x) ∈ Z_p for the key of every pair: AES under K on the 8-byte key, hashed to Z_p.
+     */
+    private BigInteger[] prfValues(byte[] prfKey, KeyValuePair[] inputPairs) {
+        byte[][] keys = Arrays.stream(inputPairs).map(pair -> LongUtils.longToByteArray(pair.key()))
+                              .toArray(byte[][]::new);
+        return zpHash.hashByValue(PRF_TWEAK, AesPrf.getBytes(prfKey, keys));
+    }
+
+    /**
+     * P2's pairs x_{2,j} ↦ v_{2,j} + r_j - (n-2) * F_K(x_{2,j}), with r_j sampled into p2Random.
+     */
+    private Map<Long, BigInteger> p2KeyValueMap(byte[] prfKey, KeyValuePair[] inputPairs, BigInteger[] p2Random) {
+        for (int i = 0; i < size; i++) {
+            p2Random[i] = zP.createRandom(secureRandom);
+        }
+        BigInteger[] fk = prfValues(prfKey, inputPairs);
+        BigInteger leaves = BigInteger.valueOf(parties - 2);
+        Map<Long, BigInteger> keyValueMap = HashMap.newHashMap(size);
+        for (int i = 0; i < size; i++) {
+            keyValueMap.put(inputPairs[i].key(), add(BigInteger.valueOf(inputPairs[i].value()),
+                    sub(p2Random[i], zP.mul(leaves, fk[i]), p), p));
+        }
+        return keyValueMap;
+    }
+
+    /**
+     * The pairs x_{i,j} ↦ v_{i,j} + F_K(x_{i,j}) of P3-Pn.
+     */
+    private Map<Long, BigInteger> pnKeyValueMap(byte[] prfKey, KeyValuePair[] inputPairs) {
+        BigInteger[] fk = prfValues(prfKey, inputPairs);
+        Map<Long, BigInteger> keyValueMap = HashMap.newHashMap(size);
+        for (int i = 0; i < size; i++) {
+            keyValueMap.put(inputPairs[i].key(), add(BigInteger.valueOf(inputPairs[i].value()), fk[i], p));
+        }
+        return keyValueMap;
+    }
+
+    /**
+     * Parties whose masked OKVS the given party adds before forwarding. Ring: P2 → P3 → … → Pn → P1. Tree: heap order
+     * rooted at P1, so ch(i) = {2i, 2i+1} ∩ [n]. Party ids are 0-based, so P_i has id i-1.
+     */
+    private int[] upstreamOf(int partyId) {
+        if (topologyType == TopologyType.TREE) {
+            return IntStream.of(2 * partyId + 1, 2 * partyId + 2).filter(c -> c < parties).toArray();
+        }
+        if (partyId == 1) {
+            return new int[0];
+        }
+        return new int[]{partyId == 0 ? parties - 1 : partyId - 1};
+    }
+
+    /**
+     * Party that the given non-root party forwards its masked OKVS to: the next party (ring) or par(i) = ⌊i/2⌋ (tree).
+     */
+    private int downstreamOf(int partyId) {
+        if (topologyType == TopologyType.TREE) {
+            return (partyId - 1) / 2;
+        }
+        return (partyId + 1) % parties;
+    }
+
+    /**
+     * Receives a masked OKVS from each source in turn and adds them into acc. The RPC layer buffers incoming packets
+     * in the background, so transfers from different sources still overlap.
+     */
+    private void addReceived(BigInteger[] acc, int[] sources) {
+        for (int k : sources) {
+            List<byte[]> receivedOkvsData = receivePayload(STEP, rpc.getParty(k));
+            MathPreconditions.checkEqual("receivedOkvsData.size()", "okvsSize", receivedOkvsData.size(), okvsSize);
+            for (int i = 0; i < okvsSize; i++) {
+                acc[i] = add(acc[i], BigIntegerUtils.byteArrayToNonNegBigInteger(receivedOkvsData.get(i)), p);
+            }
+        }
+    }
+
+    /**
+     * Ends the reduction: its measurements, then the end of this party's turn.
+     */
+    private void endReduction() throws IOException {
+        reduction = snapshot();
+        okvs = null;
+        schedule.endTurn();
+    }
+
+    private Phase snapshot() {
+        long wallNanos = System.nanoTime() - startNanos;
+        return new Phase(wallNanos, wallNanos - (meter.getWaitNanos() - waitNanosAtStart),
+                rpc.getPayloadByteLength() - sentBytesAtStart, meter.getReceivedByteLength() - recvBytesAtStart);
+    }
+
+    /**
+     * Adds the mask G(seed) ∈ Z_p^okvsSize into acc, or subtracts it. The PRG output is consumed element by element,
+     * so G(seed) is never held in full.
+     */
+    private void addPrgVector(BigInteger[] acc, byte[] seed, boolean subtract) {
         SecureRandom prg = CommonUtils.createSeedSecureRandom();
         prg.setSeed(seed);
-        BigInteger[] vector = new BigInteger[okvsSize];
         for (int i = 0; i < okvsSize; i++) {
-            vector[i] = zP.createRandom(prg);
+            BigInteger mask = zP.createRandom(prg);
+            acc[i] = subtract ? sub(acc[i], mask, p) : add(acc[i], mask, p);
         }
-        return vector;
     }
 
     /**
-     * Helper method to send BigInteger array
+     * Helper method to send an array of non-negative BigIntegers, each encoded in byteLength bytes
      */
-    private void sendBigIntegerArray(int stepId, Party targetParty, BigInteger[] data) {
+    private void sendBigIntegerArray(int stepId, Party targetParty, BigInteger[] data, int byteLength) {
         List<byte[]> payload = Arrays.stream(data)
-                                     .map(BigIntegerUtils::bigIntegerToByteArray)
+                                     .map(x -> BigIntegerUtils.nonNegBigIntegerToByteArray(x, byteLength))
                                      .collect(Collectors.toList());
         sendPayload(stepId, targetParty, payload);
     }
 
     /**
-     * Helper method to receive BigInteger array
+     * Helper method to receive an array of non-negative BigIntegers
      */
     private BigInteger[] receiveBigIntegerArray(int stepId, Party sourceParty) {
         List<byte[]> payload = receivePayload(stepId, sourceParty);
         return payload.stream()
-                      .map(BigInteger::new)
+                      .map(BigIntegerUtils::byteArrayToNonNegBigInteger)
                       .toArray(BigInteger[]::new);
     }
 
@@ -730,6 +846,7 @@ public class Protocol extends AbstractMultiPartyPto {
         private final TopologyType topologyType;
         private final ResultType resultType;
         private final boolean debug;
+        private final boolean silent;
         private final int prfLength = 16; // > 40 + 2log(input)
 
         private Config(Builder builder) {
@@ -746,6 +863,7 @@ public class Protocol extends AbstractMultiPartyPto {
             this.topologyType = builder.topologyType;
             this.resultType = builder.resultType;
             this.debug = builder.debug;
+            this.silent = builder.silent;
         }
 
         public int getSecLevel() {
@@ -800,6 +918,13 @@ public class Protocol extends AbstractMultiPartyPto {
             return prfLength;
         }
 
+        /**
+         * Whether LOOKUP's permute-and-share uses silent OT extension instead of IKNP.
+         */
+        public boolean isSilent() {
+            return silent;
+        }
+
         public static class Builder {
             private int secLevel = 128;
             private int statLevel = 40;
@@ -813,6 +938,7 @@ public class Protocol extends AbstractMultiPartyPto {
             private TopologyType topologyType = TopologyType.STAR;
             private ResultType resultType = ResultType.NONE;
             private boolean debug = false;
+            private boolean silent = false;
 
             public Builder setSecLevel(int secLevel) {
                 this.secLevel = secLevel;
@@ -874,23 +1000,26 @@ public class Protocol extends AbstractMultiPartyPto {
                 return this;
             }
 
+            public Builder setSilent(boolean silent) {
+                this.silent = silent;
+                return this;
+            }
+
             public Config build() {
-//                Random random = new SecureRandom();
-                Random random = new Random(2025);
                 if (this.q == null) {
+                    // smallest prime above M·2^λ
                     BigInteger minQ = BigInteger.valueOf(2).pow(statLevel)
                                                 .multiply(upperBoundM);
-                    int minLogQ = minQ.bitLength();
-                    this.q = BigInteger.probablePrime(minLogQ, random);
-                    System.out.println("q not set, minimal length " + minLogQ + ", generated " + this.q);
+                    this.q = minQ.nextProbablePrime();
+                    System.out.println("q not set, generated " + this.q.bitLength() + "-bit " + this.q);
                 }
                 if (this.p == null) {
+                    // smallest prime above q·m²·2^λ
                     BigInteger minP = BigInteger.valueOf(2).pow(statLevel)
                                                 .multiply(q)
                                                 .multiply(BigInteger.valueOf(size).pow(2));
-                    int minLogP = minP.bitLength();
-                    this.p = BigInteger.probablePrime(minLogP, random);
-                    System.out.println("p not set, minimal length " + minLogP + ", generated " + this.p);
+                    this.p = minP.nextProbablePrime();
+                    System.out.println("p not set, generated " + this.p.bitLength() + "-bit " + this.p);
                 }
                 return new Config(this);
             }
@@ -898,19 +1027,31 @@ public class Protocol extends AbstractMultiPartyPto {
     }
 
     /**
-     * Topology type enum
+     * Topology type enum. AIDED and LOOKUP skip the reduction and run that two-party protocol on the raw inputs of P1
+     * and P2.
      */
     public enum TopologyType {
-        STAR, RING, AIDED
+        STAR, RING, TREE, AIDED, LOOKUP
     }
 
+    /**
+     * Two-party protocol that follows the reduction: none, P1 sending its pairs to P2 in the clear, server-aided with
+     * P3 as the server, or offset lookup.
+     */
     public enum ResultType {
-        NONE, RAW, AIDED
+        NONE, RAW, AIDED, LOOKUP
     }
 
     /**
      * Key-Value pair class
      */
     public record KeyValuePair(long key, long value) {
+    }
+
+    /**
+     * Measurements since execute() started: wall time, compute time (wall time minus time blocked in receive), and
+     * payload bytes sent and received.
+     */
+    public record Phase(long wallNanos, long computeNanos, long sentBytes, long recvBytes) {
     }
 }

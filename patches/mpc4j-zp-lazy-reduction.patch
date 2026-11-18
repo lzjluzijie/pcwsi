@@ -1,0 +1,69 @@
+diff --git a/mpc4j-common-structure/src/main/java/edu/alibaba/mpc4j/common/structure/okve/dokvs/zp/H3SparseClusterBlazeGctZpDokvs.java b/mpc4j-common-structure/src/main/java/edu/alibaba/mpc4j/common/structure/okve/dokvs/zp/H3SparseClusterBlazeGctZpDokvs.java
+index 8163f2e..556acad 100644
+--- a/mpc4j-common-structure/src/main/java/edu/alibaba/mpc4j/common/structure/okve/dokvs/zp/H3SparseClusterBlazeGctZpDokvs.java
++++ b/mpc4j-common-structure/src/main/java/edu/alibaba/mpc4j/common/structure/okve/dokvs/zp/H3SparseClusterBlazeGctZpDokvs.java
+@@ -123,15 +123,18 @@ class H3SparseClusterBlazeGctZpDokvs<T> extends AbstractH3ClusterBlazeGctZpDokvs
+         int binIndex = binHash.getInteger(keyBytes, binNum);
+         int[] binSparsePositions = bins.get(binIndex).sparsePositions(key);
+         boolean[] binDensePositions = bins.get(binIndex).binaryDensePositions(key);
+-        BigInteger value = zp.createZero();
++        // sum first and reduce once, which equals reducing after every addition
++        BigInteger value = BigInteger.ZERO;
+         for (int binSparsePosition : binSparsePositions) {
+-            value = zp.add(value, storage[binLm * binIndex + binSparsePosition]);
++            assert zp.validateElement(storage[binLm * binIndex + binSparsePosition]);
++            value = value.add(storage[binLm * binIndex + binSparsePosition]);
+         }
+         for (int binDensePosition = 0; binDensePosition < binRm; binDensePosition++) {
+             if (binDensePositions[binDensePosition]) {
+-                value = zp.add(value, storage[binLm * binNum + binRm * binIndex + binDensePosition]);
++                assert zp.validateElement(storage[binLm * binNum + binRm * binIndex + binDensePosition]);
++                value = value.add(storage[binLm * binNum + binRm * binIndex + binDensePosition]);
+             }
+         }
+-        return value;
++        return zp.module(value);
+     }
+ }
+diff --git a/mpc4j-common-tool/src/main/java/edu/alibaba/mpc4j/common/tool/galoisfield/zp/JdkZp.java b/mpc4j-common-tool/src/main/java/edu/alibaba/mpc4j/common/tool/galoisfield/zp/JdkZp.java
+index ee1d31d..f7ca920 100644
+--- a/mpc4j-common-tool/src/main/java/edu/alibaba/mpc4j/common/tool/galoisfield/zp/JdkZp.java
++++ b/mpc4j-common-tool/src/main/java/edu/alibaba/mpc4j/common/tool/galoisfield/zp/JdkZp.java
+@@ -38,6 +38,37 @@ class JdkZp extends AbstractZp {
+         return a.add(b).mod(prime);
+     }
+ 
++    /**
++     * Sums the selected elements and reduces once. Equal to the default, which reduces after every addition.
++     */
++    @Override
++    public BigInteger innerProduct(final BigInteger[] elementVector, final boolean[] binaryVector) {
++        assert elementVector.length == binaryVector.length
++            : "element vector length must be equal to binary vector length = "
++            + binaryVector.length + ": " + binaryVector.length;
++        BigInteger value = BigInteger.ZERO;
++        for (int i = 0; i < elementVector.length; i++) {
++            if (binaryVector[i]) {
++                assert validateElement(elementVector[i]);
++                value = value.add(elementVector[i]);
++            }
++        }
++        return value.mod(prime);
++    }
++
++    /**
++     * Sums the elements at the positions and reduces once. Equal to the default, which reduces after every addition.
++     */
++    @Override
++    public BigInteger innerProduct(final BigInteger[] elementVector, final int[] positions) {
++        BigInteger value = BigInteger.ZERO;
++        for (int position : positions) {
++            assert validateElement(elementVector[position]);
++            value = value.add(elementVector[position]);
++        }
++        return value.mod(prime);
++    }
++
+     @Override
+     public BigInteger neg(final BigInteger a) {
+         assert validateElement(a);

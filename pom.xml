@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>anonymous.research</groupId>
+    <artifactId>pcws</artifactId>
+    <version>0.1</version>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <mpc4j.version>1.1.5</mpc4j.version>
+        <mpc4j.native.dir>${user.home}/dev/mpc4j/mpc4j-native-tool/cmake-build-release</mpc4j.native.dir>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>edu.alibaba</groupId>
+            <artifactId>mpc4j-common-rpc</artifactId>
+            <version>${mpc4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>edu.alibaba</groupId>
+            <artifactId>mpc4j-common-structure</artifactId>
+            <version>${mpc4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>edu.alibaba</groupId>
+            <artifactId>mpc4j-common-tool</artifactId>
+            <version>${mpc4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>edu.alibaba</groupId>
+            <artifactId>mpc4j-s2pc-pcg</artifactId>
+            <version>${mpc4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>edu.alibaba</groupId>
+            <artifactId>mpc4j-s2pc-opf</artifactId>
+            <version>${mpc4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <sourceDirectory>src</sourceDirectory>
+        <testSourceDirectory>test</testSourceDirectory>
+        <resources>
+            <resource>
+                <directory>src</directory>
+                <includes>
+                    <include>log4j.properties</include>
+                </includes>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <compilerArgs>
+                        <arg>--add-modules=jdk.incubator.vector</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <argLine>--add-modules jdk.incubator.vector -Xmx4g -Djava.library.path=${mpc4j.native.dir}</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <!-- Writes target/classpath.txt so parties can be launched with plain `java -cp`. -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.8.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>build-classpath</goal>
+                        </goals>
+                        <configuration>
+                            <outputFile>${project.build.directory}/classpath.txt</outputFile>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
